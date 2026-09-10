@@ -61,6 +61,11 @@ textarea{resize:vertical;min-height:72px}
 .icon{width:30px;height:30px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:var(--ink2)}
 .icon:hover{background:var(--surface)}
 .icon svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.icon{position:relative}
+.dot{position:absolute;top:4px;right:4px;width:7px;height:7px;border-radius:50%;background:var(--ink3);display:none}
+.dot.off{display:none}.dot.ok{display:block;background:var(--ok)}.dot.busy{display:block;background:var(--warn)}.dot.err{display:block;background:var(--danger)}
+.status{font-size:13px;color:var(--ink2)}
+.code{font-family:"JetBrains Mono",ui-monospace,monospace;font-size:13px;word-break:break-all}
 .cards{flex:1;overflow-y:auto;padding:0 8px 8px;display:flex;flex-direction:column;gap:8px;min-height:60px}
 .cards.over{outline:2px dashed var(--accent);outline-offset:-4px;border-radius:10px}
 .card{background:var(--surface);border-radius:10px;padding:10px 12px;box-shadow:var(--shadow);cursor:pointer;display:flex;flex-direction:column;gap:6px}
@@ -152,7 +157,10 @@ textarea{resize:vertical;min-height:72px}
 <div class="app">
   <div class="top">
     <div><h1 id="title">Tasks</h1><div class="sub" id="subtitle">Mafort · Quadro</div></div>
+    <div style="display:flex;align-items:center;gap:2px">
+    <button class="icon" id="sync-btn" title="Sincronização" aria-label="Sincronização"><span class="dot" id="sync-dot"></span><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2M3 12a9 9 0 0 1 15.5-6.2M18 3v5h-5M6 21v-5h5"/></svg></button>
     <button class="icon" id="theme-btn" title="Alternar tema" aria-label="Alternar tema"><svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9c0-.5 0-1-.1-1.4A5.5 5.5 0 0 1 12.6 3.1 9 9 0 0 0 12 3z"/></svg></button>
+    </div>
   </div>
   <div class="tabs" role="tablist">
     <button class="tab" role="tab" data-view="board" aria-selected="true">Quadro</button>
@@ -220,9 +228,25 @@ if (!data || !data.columns) {
       {id:uid(),title:'Exemplo: fechar relatório do mês',notes:'',colId:c2,deadline:new Date(now+5*3600e3).toISOString(),createdAt:now,order:0},
       {id:uid(),title:'Exemplo: tarefa concluída',notes:'',colId:c3,deadline:null,createdAt:now-86400e3,doneAt:now-3600e3,order:0}
     ] };
-  save();
+  try{ localStorage.setItem(KEY, JSON.stringify(data)); }catch(e){}
 }
-function save(){ try{ localStorage.setItem(KEY, JSON.stringify(data)); }catch(e){} }
+if(!data.deleted) data.deleted={};
+/* carimbo de alteração por item (para a sincronização): compara com o último estado salvo */
+const fp = it => { const {updatedAt, ...rest} = it; return JSON.stringify(rest); };
+let snap = {};
+function takeSnapshot(){ snap={}; data.columns.concat(data.tasks).forEach(it=>{ snap[it.id]=fp(it); }); }
+function stamp(){
+  const now=Date.now(); data.columns.forEach((c,i)=>{ c.order=i; });
+  const seen={};
+  data.columns.concat(data.tasks).forEach(it=>{ seen[it.id]=1; const f=fp(it); if(snap[it.id]!==f){ it.updatedAt=now; } else if(!it.updatedAt){ it.updatedAt=it.createdAt||now; } });
+  Object.keys(snap).forEach(id=>{ if(!seen[id]) data.deleted[id]=now; });
+  takeSnapshot();
+}
+data.columns.concat(data.tasks).forEach(it=>{ if(!it.updatedAt) it.updatedAt=it.createdAt||Date.now(); });
+takeSnapshot();
+let localVersion=0;
+function save(){ stamp(); localVersion++; try{ localStorage.setItem(KEY, JSON.stringify(data)); }catch(e){} scheduleSync(); }
+function persistOnly(){ takeSnapshot(); try{ localStorage.setItem(KEY, JSON.stringify(data)); }catch(e){} }
 const colById = id => data.columns.find(c=>c.id===id);
 const tasksIn = id => data.tasks.filter(t=>t.colId===id).sort((a,b)=>a.order-b.order);
 function moveTask(t, colId, order){
@@ -367,6 +391,73 @@ function renderCal(){
 }
 $('#cal-prev').onclick=()=>{ calCursor.setMonth(calCursor.getMonth()-1); renderCal(); };
 $('#cal-next').onclick=()=>{ calCursor.setMonth(calCursor.getMonth()+1); renderCal(); };
+
+/* ---------- sincronização (Google Apps Script) ---------- */
+const SKEY='sync.v1';
+let SYNC; try{ SYNC=JSON.parse(localStorage.getItem(SKEY)); }catch(e){}
+if(!SYNC) SYNC={url:'',key:'',calendar:true,lastOk:null,lastErr:null};
+function saveSync(){ try{ localStorage.setItem(SKEY,JSON.stringify(SYNC)); }catch(e){} }
+const syncOn = () => !!(SYNC.url && SYNC.key);
+let syncing=false, syncPending=false, syncTimer=null;
+function setDot(state){ const d=$('#sync-dot'); d.className='dot '+(syncOn()?state:'off'); }
+function scheduleSync(){ if(!syncOn()) return; clearTimeout(syncTimer); syncTimer=setTimeout(()=>sync('edit'),1500); }
+function mergeList(la,lb,deleted){
+  const map={};
+  (la||[]).concat(lb||[]).forEach(it=>{ if(!it||!it.id) return; const u=it.updatedAt||0; if(deleted[it.id]&&deleted[it.id]>=u) return; if(!map[it.id]||u>(map[it.id].updatedAt||0)) map[it.id]=it; });
+  return Object.values(map).sort((x,y)=>(x.order||0)-(y.order||0));
+}
+async function sync(reason){
+  if(!syncOn()) return false;
+  if(syncing){ syncPending=true; return false; }
+  syncing=true; setDot('busy');
+  const versionAtStart=localVersion;
+  if(!SYNC.lastOk){ data.tasks=data.tasks.filter(t=>!/^Exemplo:/.test(t.title)); } // cards de exemplo não vão para a nuvem
+  try{
+    const body=JSON.stringify({key:SYNC.key,calendar:SYNC.calendar,state:{columns:data.columns,tasks:data.tasks,deleted:data.deleted}});
+    const res=await fetch(SYNC.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body,redirect:'follow'});
+    const j=await res.json();
+    if(!j.ok) throw new Error(j.error||'resposta inválida');
+    const r=j.state;
+    // funde a resposta com o que mudou localmente enquanto a chamada estava no ar
+    const deleted=Object.assign({},r.deleted||{},data.deleted||{});
+    if(localVersion!==versionAtStart){ data.columns=mergeList(r.columns,data.columns,deleted); data.tasks=mergeList(r.tasks,data.tasks,deleted); }
+    else { data.columns=r.columns||[]; data.tasks=r.tasks||[]; }
+    data.deleted=deleted;
+    if(!data.columns.length){ data.columns=[{id:uid(),name:'To do',order:0,updatedAt:Date.now()}]; }
+    persistOnly(); render(); renderCal();
+    SYNC.lastOk=Date.now(); SYNC.lastErr=j.calendarError?('Agenda: '+j.calendarError):null; saveSync(); setDot('ok');
+    if(localVersion!==versionAtStart) scheduleSync();
+    return true;
+  }catch(e){
+    SYNC.lastErr=String(e.message||e); saveSync(); setDot('err'); return false;
+  }finally{
+    syncing=false; if(syncPending){ syncPending=false; scheduleSync(); }
+    const st=$('#sync-status'); if(st) st.textContent=syncStatusText();
+  }
+}
+function syncStatusText(){
+  if(!syncOn()) return 'Não configurado. Cada aparelho guarda seus próprios dados.';
+  let t=SYNC.lastOk?('Última sincronização: '+fmtDT(SYNC.lastOk)):'Ainda não sincronizou.';
+  if(SYNC.lastErr) t+=' · Erro: '+SYNC.lastErr;
+  return t;
+}
+function openSync(){
+  open(`<h3>Sincronização</h3>
+    <p>Mantém o quadro igual no celular e no PC e cria os prazos na sua agenda Google (avisos 12h e 3h antes). Veja o passo a passo no README do projeto.</p>
+    <div class="field"><label for="s-url">Endereço do script (termina em /exec)</label><input id="s-url" value="${esc(SYNC.url)}" placeholder="https://script.google.com/macros/s/.../exec" inputmode="url" autocapitalize="off"></div>
+    <div class="field"><label for="s-key">Chave (a mesma nos dois aparelhos)</label><div style="display:flex;gap:6px"><input id="s-key" value="${esc(SYNC.key)}" placeholder="mínimo 8 caracteres" autocapitalize="off"><button class="btn sm" id="s-gen" type="button">Gerar</button></div></div>
+    <div class="row" style="border:0;padding:6px 0"><label id="l-cal">Criar prazos na agenda Google<small>Evento "Prazo: tarefa" com avisos 12h e 3h antes</small></label><button class="switch" id="s-cal" role="switch" aria-checked="${SYNC.calendar?'true':'false'}" aria-labelledby="l-cal"></button></div>
+    <div class="status" id="sync-status">${esc(syncStatusText())}</div>
+    <div class="actions"><button class="btn sm ghost" id="s-cancel">Fechar</button><button class="btn sm" id="s-now">Sincronizar agora</button><button class="btn sm primary" id="s-save">Salvar</button></div>`);
+  const sw=$('#s-cal'); sw.onclick=()=>sw.setAttribute('aria-checked',sw.getAttribute('aria-checked')!=='true');
+  $('#s-gen').onclick=()=>{ const a='abcdefghjkmnpqrstuvwxyz23456789'; let k=''; for(let i=0;i<20;i++) k+=a[Math.floor(Math.random()*a.length)]; $('#s-key').value=k; };
+  const collect=()=>{ SYNC.url=$('#s-url').value.trim(); SYNC.key=$('#s-key').value.trim(); SYNC.calendar=sw.getAttribute('aria-checked')==='true'; saveSync(); setDot(SYNC.lastOk?'ok':'busy'); };
+  $('#s-cancel').onclick=close;
+  $('#s-save').onclick=()=>{ collect(); close(); if(syncOn()) sync('save'); };
+  $('#s-now').onclick=async()=>{ collect(); $('#s-now').disabled=true; $('#sync-status').textContent='Sincronizando…'; const ok=await sync('manual'); $('#s-now').disabled=false; toast(ok?'Sincronizado':'Falhou: '+(SYNC.lastErr||'')); };
+}
+$('#sync-btn').onclick=openSync;
+setInterval(()=>{ if(!document.hidden) sync('timer'); },90e3);
 
 /* ---------- tabs / theme ---------- */
 const subs={board:"Mafort · Quadro",cal:"Mafort · Prazos",focus:"Mafort · Temporizador"}; const titles={board:"Tasks",cal:"Tasks",focus:"Focus"};
@@ -518,11 +609,11 @@ function tick(){
   document.title=T.running?`${$('#time').textContent} · ${T.phase==='focus'?'Foco':'Descanso'}`:"Mafort Tasks & Focus";
 }
 setInterval(tick,500);
-document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ tick(); if(T.running) lock(); } });
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden){ tick(); if(T.running) lock(); sync('visible'); } });
 if(T.running && !CAP){ /* browser: audio needs a gesture after reload, so pause */ T.remaining=Math.max(0,T.endAt-Date.now()); T.running=false; T.endAt=null; saveT(); }
 if(T.running && CAP){ lock(); if(T.phase==='focus'&&T.music) setTimeout(()=>{ try{ startMusic(); }catch(e){} },500); }
 if(!CAP && 'serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('./sw.js').catch(()=>{});
 
-render(); renderCal(); tick();
+render(); renderCal(); tick(); setDot(SYNC.lastOk?'ok':'busy'); sync('load');
 })();
 </script>
