@@ -1,0 +1,71 @@
+name: Gerar APK Android
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Montar pasta web
+        run: |
+          mkdir -p www
+          cp index.html sw.js manifest.webmanifest icon-192.png icon-512.png bowl_focus.mp3 bowl_break.mp3 www/
+
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+
+      - name: Criar projeto Android
+        run: npx cap add android
+
+      - name: Ícones, sons e permissões
+        run: |
+          set -e
+          pip install pillow --quiet
+          RES=android/app/src/main/res
+          mkdir -p $RES/raw
+          cp bowl_focus.mp3 bowl_break.mp3 $RES/raw/
+          python3 android-res.py
+          # alarmes exatos para o sino tocar na hora certa
+          sed -i 's#<application#<uses-permission android:name="android.permission.USE_EXACT_ALARM" />\n    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n    <application#' android/app/src/main/AndroidManifest.xml
+
+      - name: Sincronizar web -> Android
+        run: npx cap sync android
+
+      - name: Compilar APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../mafort-tasks-focus.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mafort-tasks-focus-apk
+          path: mafort-tasks-focus.apk
+
+      - name: Publicar em Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Mafort Tasks & Focus — build ${{ github.run_number }}
+          body: "APK gerado automaticamente. Baixe pelo celular e instale."
+          files: mafort-tasks-focus.apk

@@ -1,0 +1,9 @@
+{
+  "appId": "com.mafort.tasksfocus",
+  "appName": "Mafort Tasks & Focus",
+  "webDir": "www",
+  "android": { "allowMixedContent": false },
+  "plugins": {
+    "LocalNotifications": { "smallIcon": "ic_stat_icon", "iconColor": "#2E5E63" }
+  }
+}
